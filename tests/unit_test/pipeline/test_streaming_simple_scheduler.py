@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import queue
+import threading
+import time
+from collections import Counter
+
+import pytest
+import torch
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
+from tests.unit_test.scheduling.test_streaming_vocoder import _FakeStreamingVocoder
 
 
 def _payload(request_id: str, *, stream: bool = False) -> StagePayload:
@@ -82,6 +89,189 @@ def _drain_results(scheduler: StreamingSimpleScheduler) -> list[OutgoingMessage]
             return messages
 
 
+def _run_serving_loop(scheduler: StreamingSimpleScheduler, *, limit: int = 8) -> None:
+    """Dispatch queued messages the way the serving loop does.
+
+    Bounded so a message the scheduler keeps re-queueing fails the calling
+    assertion instead of hanging the test session.
+    """
+    for _ in range(limit):
+        if not scheduler._pending_messages and scheduler.inbox.empty():
+            return
+        scheduler._handle_message(scheduler._next_message(), None)
+    raise AssertionError("scheduler did not settle; a queued message livelocked")
+
+
+def _serve(
+    scheduler: StreamingSimpleScheduler,
+    messages: list[IncomingMessage],
+    *,
+    output_count: int,
+) -> list[OutgoingMessage]:
+    """Run the real serving loop in a thread and collect ``output_count``
+    messages from the outbox; ``queue.Empty`` means the loop stopped early.
+
+    Inlined from ``tests.unit_test.pipeline.helpers.run_scheduler`` for the same
+    reason as ``test_simple_scheduler_concurrent.py``: that module drags in the
+    config/placement import graph.
+    """
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+    try:
+        for message in messages:
+            scheduler.inbox.put(message)
+        return [scheduler.outbox.get(timeout=2.0) for _ in range(output_count)]
+    finally:
+        scheduler.stop()
+        thread.join(timeout=2.0)
+
+
+def _deferred_stream_done_without_its_chunk(
+    scheduler: StreamingSimpleScheduler, request_id: str
+) -> None:
+    """Leave ``request_id`` with a deferred done whose wait bound has passed.
+
+    The deferral is created the way the collector does it: one of the request's
+    own chunks is parked and its done handed to the scheduler. The parked chunk
+    is then taken out of the queue (a later serve step, or the vocoder's own
+    drain, consumes it), so nothing is left for the request but the deferred
+    done.
+    """
+    scheduler._on_streaming_new_request(request_id, _payload(request_id, stream=True))
+    scheduler._pending_messages.append(_chunk(request_id, "older"))
+    scheduler._on_done(request_id)
+    assert request_id in scheduler._deferred_done_deadlines
+    scheduler._pending_messages.clear()
+    scheduler._deferred_done_deadlines[request_id] = time.monotonic() - 1.0
+
+
+class _FailingDoneStreamingScheduler(_TestStreamingScheduler):
+    """``on_stream_done`` fails for ``failing_done_ids`` (a failing final decode)."""
+
+    def __init__(
+        self,
+        *,
+        failing_done_ids: set[str],
+        batched: bool = False,
+        **kwargs: int,
+    ) -> None:
+        self.failing_done_ids = set(failing_done_ids)
+        self._can_batch_stream_chunks = batched
+        super().__init__(**kwargs)
+
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+        if request_id in self.failing_done_ids:
+            raise RuntimeError(f"final decode failed for {request_id!r}")
+        return super().on_stream_done(request_id)
+
+
+def _vocoder_item(chunk_id: int, frames: list[int]) -> StreamItem:
+    return StreamItem(
+        chunk_id=chunk_id,
+        data=torch.tensor(frames, dtype=torch.long),
+        from_stage="src",
+        metadata={"modality": "audio_codes", "stream": True},
+    )
+
+
+def _waveform_values(message: OutgoingMessage) -> list[float]:
+    data = message.data
+    return torch.frombuffer(
+        bytearray(data["audio_waveform"]), dtype=torch.float32
+    ).tolist()
+
+
+class _OrderedFakeStreamingVocoder(_FakeStreamingVocoder):
+    """The shared base vocoder with per-request chunk-id ordering enabled."""
+
+    _enforce_chunk_id_order = True
+
+
+def test_idle_resume_of_a_failing_deferred_done_keeps_the_loop_alive() -> None:
+    # start() drains deferred dones on idle outside its try/except, so a failing
+    # final decode there must be isolated: error for that request, that request
+    # aborted, its deferral bookkeeping cleared, and the stage still serving.
+    scheduler = _FailingDoneStreamingScheduler(failing_done_ids={"req-a"})
+    _deferred_stream_done_without_its_chunk(scheduler, "req-a")
+
+    failures: list[BaseException] = []
+    try:
+        out = _serve(scheduler, [], output_count=1)
+    except queue.Empty as exc:
+        failures.append(exc)
+
+    assert (
+        failures == []
+    ), "the idle serving loop died instead of emitting an error for req-a"
+    assert [(message.type, message.request_id) for message in out] == [
+        ("error", "req-a")
+    ]
+    assert scheduler._is_aborted("req-a")
+    assert "req-a" not in scheduler._deferred_done_deadlines
+    assert "req-a" not in scheduler._pending_done
+
+    # The failure is consumed with the request: a later resume must neither
+    # re-raise nor emit a second error.
+    scheduler._resume_deferred_stream_done()
+    assert _drain_results(scheduler) == []
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_deferred_done_failure_is_not_attributed_to_an_innocent_request(
+    batched: bool,
+) -> None:
+    # A chunk delivery resumes deferred dones. When one of those dones fails, the
+    # error belongs to the failing request: the request whose chunk triggered the
+    # resume must keep streaming.
+    scheduler = _FailingDoneStreamingScheduler(
+        failing_done_ids={"req-a"}, batched=batched
+    )
+    _deferred_stream_done_without_its_chunk(scheduler, "req-a")
+    scheduler._on_streaming_new_request("req-b", _payload("req-b", stream=True))
+
+    out = _serve(scheduler, [_chunk("req-b", "chunk")], output_count=2)
+
+    assert [(message.type, message.request_id) for message in out] == [
+        ("stream", "req-b"),
+        ("error", "req-a"),
+    ]
+    assert scheduler._is_aborted("req-a")
+    assert not scheduler._is_aborted("req-b")
+    assert "req-b" in scheduler.stream_state
+    assert "req-a" not in scheduler._deferred_done_deadlines
+
+
+def test_base_vocoder_defers_a_done_while_it_holds_a_chunk_out_of_order() -> None:
+    # `_deferred_chunks` lives in StreamingVocoderBase, so the "this request still
+    # holds a chunk" predicate must live there too: a check kept in one model
+    # subclass leaves every other chunk-id-ordered vocoder completing early and
+    # dropping the held chunk.
+    scheduler = _OrderedFakeStreamingVocoder()
+    scheduler._on_streaming_new_request("req-a", _payload("req-a", stream=True))
+    scheduler._on_chunk("req-a", _vocoder_item(1, [3, 4]))
+    assert scheduler._deferred_chunks.get("req-a")
+
+    scheduler._on_done("req-a")
+
+    # The held chunk is still unprocessed, so the done waits instead of
+    # finalizing without it and clearing the request state.
+    assert _drain_results(scheduler) == []
+    assert "req-a" in scheduler._deferred_done_deadlines
+    assert "req-a" in scheduler._stream_states
+
+    # The missing head lands: the held chunk is ingested after it and the
+    # deferred done completes exactly once with both chunks, in order.
+    scheduler._on_chunk("req-a", _vocoder_item(0, [1, 2]))
+    out = _drain_results(scheduler)
+    assert [message.type for message in out] == ["stream", "result"]
+    assert out[-1].request_id == "req-a"
+    assert out[-1].data.data["frames"] == 2
+    assert _waveform_values(out[0]) == [1.0, 2.0, 3.0, 4.0]
+    assert "req-a" not in scheduler._deferred_done_deadlines
+    assert "req-a" not in scheduler._pending_done
+    assert not scheduler._deferred_chunks.get("req-a")
+
+
 def test_streaming_simple_scheduler_batches_non_streaming_requests() -> None:
     scheduler = _TestStreamingScheduler(max_batch_size=3)
     first = IncomingMessage("a", "new_request", _payload("a"))
@@ -98,10 +288,13 @@ def test_streaming_simple_scheduler_batches_non_streaming_requests() -> None:
 def test_non_streaming_batch_skips_done_before_later_payloads() -> None:
     scheduler = _TestStreamingScheduler(max_batch_size=3)
     first = IncomingMessage("a", "new_request", _payload("a"))
-    scheduler.inbox.put(IncomingMessage("b", "stream_done"))
-    scheduler.inbox.put(IncomingMessage("b", "new_request", _payload("b")))
-    scheduler.inbox.put(IncomingMessage("c", "stream_done"))
-    scheduler.inbox.put(IncomingMessage("c", "new_request", _payload("c")))
+    for msg in (
+        IncomingMessage("b", "stream_done"),
+        IncomingMessage("b", "new_request", _payload("b")),
+        IncomingMessage("c", "stream_done"),
+        IncomingMessage("c", "new_request", _payload("c")),
+    ):
+        scheduler.inbox.put(msg)
 
     batch = scheduler._collect_new_request_batch(first)
     scheduler._handle_new_request_batch(batch)
@@ -111,6 +304,99 @@ def test_non_streaming_batch_skips_done_before_later_payloads() -> None:
     assert scheduler.batch_calls == [["a", "b", "c"]]
     assert [msg.request_id for msg in _drain_results(scheduler)] == ["a", "b", "c"]
     assert not scheduler._pending_messages
+    assert not scheduler._pending_done
+
+
+def test_non_streaming_batch_cost_limit_bounds_the_inbox_batch() -> None:
+    # Ordering is request-local, not a global FIFO: collection reads the inbox
+    # eagerly (that is what keeps first-audio latency low) and leaves the parked
+    # deque to `_next_message`.
+    scheduler = _TestStreamingScheduler(max_batch_size=4)
+    scheduler._request_cost_fn = lambda payload: payload.data["cost"]
+    scheduler._max_batch_cost = 3
+    requests = []
+    for rid, cost in (("a", 1), ("b", 2), ("c", 3), ("d", 2), ("e", 1)):
+        payload = _payload(rid)
+        payload.data["cost"] = cost
+        requests.append(IncomingMessage(rid, "new_request", payload))
+    parked = [IncomingMessage("b", "stream_done"), requests[1], requests[2]]
+    scheduler._pending_messages.extend(parked)
+    scheduler.inbox.put(requests[3])
+    scheduler.inbox.put(requests[4])
+
+    batch = scheduler._collect_new_request_batch(requests[0])
+
+    # a (1) + d (2) fill the cost budget; e (1) would exceed it.
+    assert batch == [requests[0], requests[3]]
+    # Nothing is lost: the parked messages stay, the rejected message is kept.
+    assert Counter(
+        (msg.request_id, msg.type) for msg in scheduler._pending_messages
+    ) == (
+        Counter(
+            [
+                ("b", "stream_done"),
+                ("b", "new_request"),
+                ("c", "new_request"),
+                ("e", "new_request"),
+            ]
+        )
+    )
+    assert scheduler.inbox.empty()
+
+    scheduler._handle_new_request_batch(batch)
+    _run_serving_loop(scheduler, limit=8)
+
+    assert scheduler.batch_calls == [["a", "d"]]
+    # Deferral keeps arrival order: e was rejected after b and c were already
+    # parked, so it is served behind them (front-inserting a deferral would make
+    # the deque LIFO and postpone the oldest work indefinitely).
+    assert scheduler.single_calls == ["b", "c", "e"]
+    assert sorted(msg.request_id for msg in _drain_results(scheduler)) == [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+    ]
+    assert not scheduler._pending_done
+
+
+def test_non_streaming_batch_reads_the_inbox_past_a_parked_done_marker() -> None:
+    scheduler = _TestStreamingScheduler(max_batch_size=3)
+    scheduler._on_streaming_new_request("stream", _payload("stream", stream=True))
+    first = IncomingMessage("a", "new_request", _payload("a"))
+    parked_done = IncomingMessage("stream", "stream_done")
+    parked_payload = IncomingMessage("b", "new_request", _payload("b"))
+    newer = IncomingMessage("c", "new_request", _payload("c"))
+    scheduler._pending_messages.extend([parked_done, parked_payload])
+    scheduler.inbox.put(newer)
+
+    assert scheduler._collect_new_request_batch(first) == [first, newer]
+    assert list(scheduler._pending_messages) == [parked_done, parked_payload]
+    assert scheduler.inbox.empty()
+
+
+def test_stream_done_defers_while_a_chunk_of_the_same_request_is_parked() -> None:
+    scheduler = _TestStreamingScheduler()
+    scheduler._on_streaming_new_request("req", _payload("req", stream=True))
+    parked = _chunk("req", "older")
+    scheduler._pending_messages.append(parked)
+
+    scheduler._on_done("req")
+
+    # The request still has an unprocessed chunk of its own parked ahead of the
+    # completion, so the done waits instead of clearing the request state (which
+    # would drop that chunk).
+    assert _drain_results(scheduler) == []
+    assert scheduler.stream_state == {"req"}
+    assert any(message is parked for message in scheduler._pending_messages)
+
+    # The parked chunk is served first; the deferred done is re-dispatched after it.
+    _run_serving_loop(scheduler)
+
+    out = _drain_results(scheduler)
+    assert [message.type for message in out] == ["stream", "result"]
+    assert scheduler.stream_state == set()
     assert not scheduler._pending_done
 
 
@@ -241,6 +527,25 @@ def test_stream_chunk_batch_coalesces_queued_chunks_into_one_pump() -> None:
     assert [m.data["chunk"] for m in _drain_results(scheduler)] == ["x", "y", "z"]
 
 
+def test_stream_chunk_batch_coalesces_queued_inbox_chunks_only() -> None:
+    # Eager inbox reads: peers queued behind the first chunk coalesce into one
+    # pump, while parked messages stay for the serving loop. Reading the parked
+    # deque first is what serialised the pipeline.
+    scheduler = _BatchStreamingScheduler(max_batch_size=3)
+    chunks = [_chunk(rid, rid) for rid in ("a", "b", "c", "d", "e")]
+    parked = chunks[1:3]
+    scheduler._pending_messages.extend(parked)
+    for msg in chunks[3:]:
+        scheduler.inbox.put(msg)
+
+    scheduler._handle_message(chunks[0], None)
+
+    assert scheduler.pump_batches == [["a", "d", "e"]]
+    assert [m.data["chunk"] for m in _drain_results(scheduler)] == ["a", "d", "e"]
+    assert list(scheduler._pending_messages) == parked
+    assert scheduler.inbox.empty()
+
+
 def test_stream_chunk_batch_can_stop_before_duplicate_request() -> None:
     scheduler = _DistinctBatchStreamingScheduler(max_batch_size=4)
     scheduler.inbox.put(_chunk("b", "y"))
@@ -282,6 +587,39 @@ def test_stream_chunk_batch_respects_cap() -> None:
     scheduler._handle_message(_chunk("a", "x"), None)
     assert scheduler.pump_batches == [["a", "b"]]
     assert scheduler._next_message().request_id == "c"
+
+
+def test_deferred_messages_keep_arrival_order() -> None:
+    # Deferral used to front-insert, so the newest deferred message was served
+    # first and the oldest could be postponed indefinitely. Each collector pass
+    # below parks the marker behind its chunk; the queue must pop them in
+    # arrival order.
+    scheduler = _TestStreamingScheduler(max_batch_size=3)
+    for rid in ("a", "b", "c"):
+        first = _chunk(rid, rid)
+        scheduler.inbox.put(IncomingMessage(rid, "stream_done"))
+        assert scheduler._collect_stream_chunk_batch(first) == [first]
+
+    assert [msg.request_id for msg in scheduler._pending_messages] == ["a", "b", "c"]
+    assert [scheduler._next_message().request_id for _ in range(3)] == [
+        "a",
+        "b",
+        "c",
+    ]
+
+
+def test_deferred_messages_use_the_arrival_stamp_when_present() -> None:
+    # Inbox instrumentation stamps arrivals, so a deferral must land by stamp:
+    # re-deferring an older message must not place it behind newer ones.
+    scheduler = _TestStreamingScheduler(max_batch_size=3)
+    for rid, arrived_at in (("c", 30.0), ("a", 10.0), ("b", 20.0)):
+        first = _chunk(rid, rid)
+        marker = IncomingMessage(rid, "stream_done")
+        object.__setattr__(marker, "arrived_at", arrived_at)
+        scheduler.inbox.put(marker)
+        assert scheduler._collect_stream_chunk_batch(first) == [first]
+
+    assert [msg.request_id for msg in scheduler._pending_messages] == ["a", "b", "c"]
 
 
 def test_stream_chunk_batch_default_hook_emits_per_chunk_in_order() -> None:
