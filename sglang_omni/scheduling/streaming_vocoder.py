@@ -99,6 +99,12 @@ class StreamingVocoderBase(
     set to ``audio_latents`` by continuous-latent vocoders.
     """
 
+    # Chunk ids are contiguous per request at the producer, so a scheduler whose
+    # transport can deliver chunks out of order can hold a chunk that arrives
+    # ahead of its predecessors instead of ingesting (and decoding) it out of
+    # order. Off by default: most vocoder inputs arrive in producer order.
+    _enforce_chunk_id_order: bool = False
+
     def __init__(
         self,
         compute_fn: Callable[[Any], Any] | None,
@@ -116,6 +122,8 @@ class StreamingVocoderBase(
         self._stream_states: dict[str, StreamStateT] = {}
         self._emitted_stream_ids: set[str] = set()
         self._completed_stream_request_ids: dict[str, None] = {}
+        self._next_chunk_ids: dict[str, int] = {}
+        self._deferred_chunks: dict[str, dict[int, torch.Tensor]] = {}
         self._sample_rate = int(sample_rate)
         self._stream_source_hint = stream_source_hint or type(self).__name__
         self._stream_input_modality = str(stream_input_modality)
@@ -221,6 +229,7 @@ class StreamingVocoderBase(
             return
         item = self._validate_stream_chunk_item(request_id, item)
         self.on_stream_chunk_batch([(request_id, item)])
+        self._resume_deferred_stream_done()
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         payload = self._stream_payloads[request_id]
@@ -250,6 +259,8 @@ class StreamingVocoderBase(
 
     def clear_stream_state(self, request_id: str) -> None:
         self._emitted_stream_ids.discard(request_id)
+        self._next_chunk_ids.pop(request_id, None)
+        self._deferred_chunks.pop(request_id, None)
         state = self._stream_states.pop(request_id, None)
         if state is not None:
             self.release_stream_resources(request_id, state)
@@ -330,8 +341,50 @@ class StreamingVocoderBase(
                 f"carry a torch.Tensor, got {type(codes).__name__}"
             )
         codes = self.validate_chunk(request_id, state, codes)
-        self.ingest(request_id, state, codes)
+        self._ingest_chunk_in_order(request_id, state, item.chunk_id, codes)
         return state
+
+    def _ingest_chunk_in_order(
+        self,
+        request_id: str,
+        state: StreamStateT,
+        chunk_id: int,
+        codes: torch.Tensor,
+    ) -> None:
+        """Append a chunk in producer order when the scheduler enforces it: a
+        chunk ahead of the request's next expected id waits until its
+        predecessors arrive, and a replayed id is dropped instead of
+        duplicating its tokens. Ids are contiguous per request, so the arrival
+        that fills the gap drains the held chunks."""
+        if not self._enforce_chunk_id_order:
+            self.ingest(request_id, state, codes)
+            return
+        expected = self._next_chunk_ids.get(request_id, 0)
+        if chunk_id < expected:
+            return
+        deferred = self._deferred_chunks.get(request_id)
+        if chunk_id > expected:
+            if deferred is None:
+                deferred = {}
+                self._deferred_chunks[request_id] = deferred
+            deferred[chunk_id] = codes
+            return
+        self.ingest(request_id, state, codes)
+        expected += 1
+        while deferred is not None and expected in deferred:
+            self.ingest(request_id, state, deferred.pop(expected))
+            expected += 1
+        if deferred is not None and not deferred:
+            self._deferred_chunks.pop(request_id, None)
+        self._next_chunk_ids[request_id] = expected
+
+    def _stream_has_unprocessed_chunk(self, request_id: str) -> bool:
+        """A chunk that arrived ahead of its predecessors is unprocessed even
+        though it is not in the shared queues (see ``_deferred_chunks``):
+        completing the done now would clear the state and drop it."""
+        if self._deferred_chunks.get(request_id):
+            return True
+        return super()._stream_has_unprocessed_chunk(request_id)
 
     def _decode_and_emit(
         self, request_id: str, state: StreamStateT

@@ -29,6 +29,10 @@ _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
 _COMPLETED_NON_STREAMING_REQUEST_ID_LIMIT = 10000
 _COMPLETED_NON_STREAMING_REQUEST_ID_RETAINED = 5000
+# A stream_done waiting on one of its own unprocessed chunks must not hang the
+# request forever when that chunk never lands: after this bound it completes
+# anyway (with a warning), dropping the missing chunk.
+_STREAM_DONE_MAX_WAIT_S = 5.0
 
 
 class StreamingSimpleScheduler:
@@ -71,6 +75,7 @@ class StreamingSimpleScheduler:
         self._running = False
         self._pending_messages: collections.deque[IncomingMessage] = collections.deque()
         self._pending_done: set[str] = set()
+        self._deferred_done_deadlines: dict[str, float] = {}
         self._stream_payloads: dict[str, Any] = {}
         self._aborted_request_ids: set[str] = set()
         self._completed_non_streaming_request_ids: set[str] = set()
@@ -138,6 +143,9 @@ class StreamingSimpleScheduler:
             while self._running:
                 msg = self._next_message()
                 if msg is None:
+                    # No work and no message: give deferred dones their
+                    # deadline check so a missing chunk cannot stall forever.
+                    self._resume_deferred_stream_done()
                     continue
                 if self._is_aborted(msg.request_id):
                     continue
@@ -190,6 +198,26 @@ class StreamingSimpleScheduler:
         except _queue_mod.Empty:
             return None
 
+    def _defer_message(self, msg: IncomingMessage) -> None:
+        """Put a message back into the deferred queue in arrival order.
+
+        Front-inserting a deferral makes the queue LIFO, so the newest deferred
+        message is served first and the oldest can be postponed indefinitely.
+        A message stamped with ``arrived_at`` (the inbox instrumentation) is
+        placed before the first newer one; without the stamp it is appended,
+        which keeps arrival order because it was popped before anything still
+        queued could arrive."""
+        arrived_at = getattr(msg, "arrived_at", None)
+        if arrived_at is None:
+            self._pending_messages.append(msg)
+            return
+        for index, queued in enumerate(self._pending_messages):
+            queued_at = getattr(queued, "arrived_at", None)
+            if queued_at is not None and queued_at > arrived_at:
+                self._pending_messages.insert(index, msg)
+                return
+        self._pending_messages.append(msg)
+
     # ------------------------------------------------------------------
     # Abort and cleanup
     # ------------------------------------------------------------------
@@ -213,6 +241,7 @@ class StreamingSimpleScheduler:
         with self._state_lock:
             self._stream_payloads.pop(request_id, None)
             self._pending_done.discard(request_id)
+            self._deferred_done_deadlines.pop(request_id, None)
             self.clear_stream_state(request_id)
             if not keep_aborted:
                 with self._abort_lock:
@@ -311,7 +340,7 @@ class StreamingSimpleScheduler:
                     self.abort(msg.request_id)
                     continue
                 if batch and batch_cost + msg_cost > self._max_batch_cost:
-                    self._pending_messages.appendleft(msg)
+                    self._defer_message(msg)
                     break
                 batch_cost += msg_cost
             batch.append(msg)
@@ -320,7 +349,7 @@ class StreamingSimpleScheduler:
     def _collect_stream_chunk_batch(
         self, first_msg: IncomingMessage
     ) -> list[IncomingMessage]:
-        """Front-pushback of the first non-chunk message preserves arrival order; no blocking
+        """Pushback of the first non-chunk message in arrival order; no blocking
         wait, so only already-queued chunks coalesce."""
         batch = [first_msg]
         seen_request_ids = (
@@ -337,12 +366,12 @@ class StreamingSimpleScheduler:
             except _queue_mod.Empty:
                 break
             if msg.type != "stream_chunk":
-                self._pending_messages.appendleft(msg)
+                self._defer_message(msg)
                 break
             if self._is_aborted(msg.request_id):
                 continue
             if seen_request_ids is not None and msg.request_id in seen_request_ids:
-                self._pending_messages.appendleft(msg)
+                self._defer_message(msg)
                 break
             batch.append(msg)
             if seen_request_ids is not None:
@@ -401,6 +430,7 @@ class StreamingSimpleScheduler:
         with self._state_lock:
             for msg in active:
                 self._pending_done.discard(msg.request_id)
+                self._deferred_done_deadlines.pop(msg.request_id, None)
 
         valid: list[IncomingMessage] = []
         for msg in active:
@@ -480,13 +510,18 @@ class StreamingSimpleScheduler:
     def _handle_streaming_new_request(self, request_id: str, payload: Any) -> None:
         with self._abort_lock:
             self._aborted_request_ids.discard(request_id)
+        replay_done = False
         with self._state_lock:
             self._completed_non_streaming_request_ids.discard(request_id)
             self._stream_payloads[request_id] = payload
             self.on_streaming_new_request(request_id, payload)
             if request_id in self._pending_done:
                 self._pending_done.discard(request_id)
-                self._handle_stream_done(request_id)
+                replay_done = True
+        if replay_done:
+            # Off ``_state_lock``: the replayed done may run the external abort
+            # cleanup, which must never hold the lock.
+            self._handle_stream_done(request_id)
 
     def _handle_stream_chunk(self, request_id: str, item: Any) -> None:
         item = self._validate_stream_chunk_item(request_id, item)
@@ -494,6 +529,9 @@ class StreamingSimpleScheduler:
             for out in self.on_stream_chunk(request_id, item):
                 if not self._is_aborted(request_id):
                     self.outbox.put(out)
+        # Off ``_state_lock`` so a failing resume's abort callback is not run
+        # under it (the batch path is shaped the same way).
+        self._resume_deferred_stream_done()
 
     def _handle_stream_chunk_batch(self, batch: list[IncomingMessage]) -> None:
         items: list[tuple[str, StreamItem]] = []
@@ -514,9 +552,14 @@ class StreamingSimpleScheduler:
         ]
         if items:
             self.on_stream_chunk_batch(items)
+        self._resume_deferred_stream_done()
 
     def _handle_stream_done(self, request_id: str) -> None:
+        drain_failure: BaseException | None = None
         with self._state_lock:
+            if self._is_aborted(request_id):
+                # An abort already owns this request's error and cleanup.
+                return
             if request_id not in self._stream_payloads:
                 if request_id in self._completed_non_streaming_request_ids:
                     return
@@ -525,11 +568,103 @@ class StreamingSimpleScheduler:
                     if not self._is_aborted(request_id):
                         self.outbox.put(out)
                 return
-            for out in self.on_stream_done(request_id):
+            try:
+                self.drain_parked_chunks_for_done(request_id)
+            except Exception as exc:
+                # Exactly one owner: error and abort the request here, and run
+                # its external cleanup below, off ``_state_lock``.
+                drain_failure = exc
+                self._emit_error(request_id, exc)
+                self._abort_state(request_id)
+                self._drop_deferred_stream_done(request_id)
+            if drain_failure is None and self._defer_stream_done_for_pending_chunk(
+                request_id
+            ):
+                return
+            # The drain above failed, or an abort landed while the done was
+            # judged: never finalize a request that is no longer live.
+            if not self._is_aborted(request_id) and request_id in self._stream_payloads:
+                for out in self.on_stream_done(request_id):
+                    if not self._is_aborted(request_id):
+                        self.outbox.put(out)
                 if not self._is_aborted(request_id):
-                    self.outbox.put(out)
-            if not self._is_aborted(request_id):
-                self._clear_request_state(request_id)
+                    self._clear_request_state(request_id)
+        if drain_failure is not None:
+            self._cleanup_aborted_request(request_id)
+
+    def drain_parked_chunks_for_done(self, request_id: str) -> None:
+        """Hook: ingest this request's parked chunks before its done is judged.
+
+        A chunk parked by a collector can sit behind a long pump step, which
+        outlives any sane wait bound. The chunk is already in hand, so the
+        default scheduler has nothing to do; vocoders that ingest chunks pull
+        their own parked ones in here. An implementation raises when a parked
+        chunk cannot be ingested: ``_handle_stream_done`` owns the request's
+        single error and abort, and its external cleanup, off ``_state_lock``."""
+
+    def _stream_has_unprocessed_chunk(self, request_id: str) -> bool:
+        """Whether this request still owns a chunk that has not been ingested.
+
+        Ordering is request-local: a chunk parked for another request must not
+        hold up this done. Subclasses that also buffer chunks outside the
+        shared queues (see ``StreamingVocoderBase``) extend this."""
+        return any(
+            msg.type == "stream_chunk" and msg.request_id == request_id
+            for msg in self._pending_messages
+        )
+
+    def _defer_stream_done_for_pending_chunk(self, request_id: str) -> bool:
+        """True while the request's own chunk is still unprocessed: completing
+        now would clear the state and drop that chunk. The wait is bounded so a
+        chunk id that never arrives cannot hang the request."""
+        if not self._stream_has_unprocessed_chunk(request_id):
+            self._drop_deferred_stream_done(request_id)
+            return False
+        deadline = self._deferred_done_deadlines.setdefault(
+            request_id, time.monotonic() + _STREAM_DONE_MAX_WAIT_S
+        )
+        self._pending_done.add(request_id)
+        if time.monotonic() < deadline:
+            return True
+        logger.warning(
+            "%s: stream_done for %s waited %.1fs on an unprocessed chunk; "
+            "completing without it",
+            self.__class__.__name__,
+            request_id,
+            _STREAM_DONE_MAX_WAIT_S,
+        )
+        self._drop_deferred_stream_done(request_id)
+        return False
+
+    def _drop_deferred_stream_done(self, request_id: str) -> None:
+        self._pending_done.discard(request_id)
+        self._deferred_done_deadlines.pop(request_id, None)
+
+    def _resume_deferred_stream_done(self) -> None:
+        """Re-dispatch done markers whose own chunks have landed (or whose wait
+        bound expired). Runs after chunk delivery and whenever the serving loop
+        goes idle, so a deferred done never depends on a later arrival.
+
+        A failing final decode stays with its own request: the resume is
+        triggered by another request's chunk (or by the idle loop), so letting
+        the exception escape would abort the innocent request or kill the
+        serving loop and re-raise on every later resume."""
+        with self._state_lock:
+            request_ids = list(self._deferred_done_deadlines)
+        for request_id in request_ids:
+            try:
+                self._handle_stream_done(request_id)
+            except Exception as exc:
+                logger.exception(
+                    "%s: deferred stream_done failed for %s",
+                    self.__class__.__name__,
+                    request_id,
+                )
+                with self._state_lock:
+                    self._emit_error(request_id, exc)
+                    self._abort_state(request_id)
+                    self._drop_deferred_stream_done(request_id)
+                self._cleanup_aborted_request(request_id)
 
     # Compatibility wrappers for existing tests and subclasses.
     def _on_streaming_new_request(self, request_id: str, payload: Any) -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 import queue as _queue_mod
 import time
@@ -67,6 +68,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     _can_batch_stream_chunks = True
     _stream_chunk_batch_distinct_requests = True
+    _enforce_chunk_id_order = True
     # note (guozhihao-224): follow-up hops are a separate knife from
     # first-hop coalescing. Keep this on once equal-shape causal batch
     # is the default; A/B turns it off to isolate ITL/C50.
@@ -212,7 +214,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             if self._is_aborted(msg.request_id):
                 continue
             if msg.type != "new_request":
-                self._pending_messages.appendleft(msg)
+                self._defer_message(msg)
                 break
             try:
                 is_streaming = self.is_streaming_payload(msg.data)
@@ -221,7 +223,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 self.abort(msg.request_id)
                 continue
             if not is_streaming or msg.request_id in seen:
-                self._pending_messages.appendleft(msg)
+                self._defer_message(msg)
                 break
             seen.add(msg.request_id)
             batch.append(msg)
@@ -280,10 +282,11 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 continue
             batch.append(msg)
             seen.add(msg.request_id)
+        # Arrival order: the deferred chunks were popped before the leftover.
+        for msg in deferred:
+            self._defer_message(msg)
         if leftover is not None:
-            self._pending_messages.appendleft(leftover)
-        for msg in reversed(deferred):
-            self._pending_messages.appendleft(msg)
+            self._defer_message(leftover)
         return batch
 
     def _first_hop_group_size(self) -> int:
@@ -337,10 +340,39 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 self._emit_error(msg.request_id, exc)
                 self.abort(msg.request_id)
                 return True
-            self._pending_messages.appendleft(msg)
+            self._defer_message(msg)
             return False
-        self._pending_messages.appendleft(msg)
+        self._defer_message(msg)
         return False
+
+    def drain_parked_chunks_for_done(self, request_id: str) -> None:
+        """Ingest this request's chunks that a collector parked mid-pump.
+
+        Waiting for the serving loop to walk the parked queue can take longer
+        than the request's own chunks need to arrive, and the done would then
+        finalize without them. The parked chunks are this request's earlier
+        ones, so appending them now keeps the token order intact. A chunk that
+        fails validation or ingest raises to the done path, which owns the
+        request's single error, abort, and off-lock cleanup."""
+        mine = [
+            msg
+            for msg in self._pending_messages
+            if msg.type == "stream_chunk" and msg.request_id == request_id
+        ]
+        if not mine:
+            return
+        self._pending_messages = collections.deque(
+            msg
+            for msg in self._pending_messages
+            if not (msg.type == "stream_chunk" and msg.request_id == request_id)
+        )
+        # Validate before sorting: a payload that is not a StreamItem has no
+        # chunk_id, and must surface as the stream-chunk contract error.
+        items = [self._validate_stream_chunk_item(request_id, msg.data) for msg in mine]
+        for item in sorted(items, key=lambda item: item.chunk_id):
+            if self._is_aborted(request_id):
+                return
+            self._ingest_stream_item(request_id, item)
 
     def _wait_for_first_hop_peers(self) -> None:
         if self._first_hop_group_size() >= 2:
@@ -445,8 +477,12 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 msg = self.inbox.get_nowait()
             except _queue_mod.Empty:
                 return
-            if not self._ingest_peer_message(msg):
-                return
+            # A message the readers cannot consume (a done marker, a non
+            # streaming payload) goes back to the scheduler queue, and the
+            # drain continues: stopping here would park every chunk behind that
+            # marker until the serving loop comes back around, which is long
+            # enough for the request's own done to finalize without them.
+            self._ingest_peer_message(msg)
 
     def _pump_one_step(self) -> list[str] | None:
         participants = self.select_step_participants()
